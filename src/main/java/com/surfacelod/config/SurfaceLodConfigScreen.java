@@ -3,8 +3,8 @@ package com.surfacelod.config;
 import me.shedaniel.clothconfig2.api.ConfigBuilder;
 import me.shedaniel.clothconfig2.api.ConfigCategory;
 import me.shedaniel.clothconfig2.api.ConfigEntryBuilder;
-import net.minecraft.client.gui.screen.Screen;
-import net.minecraft.text.Text;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
 
 /** Cloth Config settings screen, opened from Mod Menu. */
 public final class SurfaceLodConfigScreen {
@@ -18,77 +18,77 @@ public final class SurfaceLodConfigScreen {
 
         ConfigBuilder builder = ConfigBuilder.create()
                 .setParentScreen(parent)
-                .setTitle(Text.literal("Surface LOD Settings"))
+                .setTitle(Component.literal("Surface LOD Settings"))
                 .setSavingRunnable(SurfaceLodConfig::save);
         ConfigEntryBuilder eb = builder.entryBuilder();
 
         // ---------- General ----------
-        ConfigCategory general = builder.getOrCreateCategory(Text.literal("General"));
+        ConfigCategory general = builder.getOrCreateCategory(Component.literal("General"));
 
-        general.addEntry(eb.startBooleanToggle(Text.literal("Enable LOD"), cfg.enabled)
+        general.addEntry(eb.startBooleanToggle(Component.literal("Enable LOD"), cfg.enabled)
                 .setDefaultValue(def.enabled)
-                .setTooltip(Text.literal("Turns distant surface terrain on or off."))
+                .setTooltip(Component.literal("Turns distant surface terrain on or off."))
                 .setSaveConsumer(v -> cfg.enabled = v)
                 .build());
 
-        general.addEntry(eb.startIntSlider(Text.literal("LOD distance"), cfg.lodDistanceChunks,
+        general.addEntry(eb.startIntSlider(Component.literal("LOD distance"), cfg.lodDistanceChunks,
                         SurfaceLodConfig.MIN_DISTANCE, SurfaceLodConfig.MAX_DISTANCE)
                 .setDefaultValue(def.lodDistanceChunks)
-                .setTextGetter(v -> Text.literal(v + " chunks"))
-                .setTooltip(Text.literal("How far the LOD terrain reaches, in chunks."))
+                .setTextGetter(v -> Component.literal(v + " chunks"))
+                .setTooltip(Component.literal("How far the LOD terrain reaches, in chunks."))
                 .setSaveConsumer(v -> cfg.lodDistanceChunks = v)
                 .build());
 
-        general.addEntry(eb.startIntSlider(Text.literal("LOD cache size"), cfg.cacheSizeMb,
+        general.addEntry(eb.startIntSlider(Component.literal("LOD cache size"), cfg.cacheSizeMb,
                         SurfaceLodConfig.MIN_CACHE_MB, SurfaceLodConfig.MAX_CACHE_MB)
                 .setDefaultValue(def.cacheSizeMb)
-                .setTextGetter(v -> Text.literal(v + " MB"))
-                .setTooltip(Text.literal("Maximum memory used to keep LOD data. Keep it low on 4 GB devices."))
+                .setTextGetter(v -> Component.literal(v + " MB"))
+                .setTooltip(Component.literal("Maximum memory used to keep LOD data. Keep it low on 4 GB devices."))
                 .setSaveConsumer(v -> cfg.cacheSizeMb = v)
                 .build());
 
         // ---------- Quality & performance ----------
-        ConfigCategory perf = builder.getOrCreateCategory(Text.literal("Quality & Performance"));
+        ConfigCategory perf = builder.getOrCreateCategory(Component.literal("Quality & Performance"));
 
-        perf.addEntry(eb.startEnumSelector(Text.literal("LOD quality"),
+        perf.addEntry(eb.startEnumSelector(Component.literal("LOD quality"),
                         SurfaceLodConfig.LodQuality.class, cfg.quality)
                 .setDefaultValue(def.quality)
-                .setTooltip(Text.literal("Detail level of LOD terrain. Lower is faster."))
+                .setTooltip(Component.literal("Detail level of LOD terrain. Lower is faster."))
                 .setSaveConsumer(v -> cfg.quality = v)
                 .build());
 
-        perf.addEntry(eb.startEnumSelector(Text.literal("CPU mode"),
+        perf.addEntry(eb.startEnumSelector(Component.literal("CPU mode"),
                         SurfaceLodConfig.CpuMode.class, cfg.cpuMode)
                 .setDefaultValue(def.cpuMode)
-                .setTooltip(Text.literal("How much CPU time LOD generation may use. Minimal = smoothest game."))
+                .setTooltip(Component.literal("How much CPU time LOD generation may use. Minimal = smoothest game."))
                 .setSaveConsumer(v -> cfg.cpuMode = v)
                 .build());
 
-        perf.addEntry(eb.startEnumSelector(Text.literal("LOD render style"),
+        perf.addEntry(eb.startEnumSelector(Component.literal("LOD render style"),
                         SurfaceLodConfig.RenderStyle.class, cfg.renderStyle)
                 .setDefaultValue(def.renderStyle)
-                .setTooltip(Text.literal("How distant terrain is drawn."))
+                .setTooltip(Component.literal("How distant terrain is drawn."))
                 .setSaveConsumer(v -> cfg.renderStyle = v)
                 .build());
 
         // ---------- Visuals ----------
-        ConfigCategory visuals = builder.getOrCreateCategory(Text.literal("Visuals"));
+        ConfigCategory visuals = builder.getOrCreateCategory(Component.literal("Visuals"));
 
-        visuals.addEntry(eb.startBooleanToggle(Text.literal("Render distant structures"), cfg.renderStructures)
+        visuals.addEntry(eb.startBooleanToggle(Component.literal("Render distant structures"), cfg.renderStructures)
                 .setDefaultValue(def.renderStructures)
-                .setTooltip(Text.literal("Show far away structures such as villages in the LOD."))
+                .setTooltip(Component.literal("Show far away structures such as villages in the LOD."))
                 .setSaveConsumer(v -> cfg.renderStructures = v)
                 .build());
 
-        visuals.addEntry(eb.startBooleanToggle(Text.literal("Disable vanilla fog"), cfg.disableVanillaFog)
+        visuals.addEntry(eb.startBooleanToggle(Component.literal("Disable vanilla fog"), cfg.disableVanillaFog)
                 .setDefaultValue(def.disableVanillaFog)
-                .setTooltip(Text.literal("Removes the vanilla distance fog so LOD terrain stays visible."))
+                .setTooltip(Component.literal("Removes the vanilla distance fog so LOD terrain stays visible."))
                 .setSaveConsumer(v -> cfg.disableVanillaFog = v)
                 .build());
 
-        visuals.addEntry(eb.startBooleanToggle(Text.literal("Smooth LOD to vanilla transition"), cfg.smoothTransition)
+        visuals.addEntry(eb.startBooleanToggle(Component.literal("Smooth LOD to vanilla transition"), cfg.smoothTransition)
                 .setDefaultValue(def.smoothTransition)
-                .setTooltip(Text.literal("Blends the border between vanilla chunks and LOD terrain."))
+                .setTooltip(Component.literal("Blends the border between vanilla chunks and LOD terrain."))
                 .setSaveConsumer(v -> cfg.smoothTransition = v)
                 .build());
 
