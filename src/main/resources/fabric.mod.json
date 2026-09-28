@@ -9,7 +9,7 @@
   "environment": "client",
   "entrypoints": {
     "client": [
-      "com.surfacelod.SurfaceLodMod"
+      "com.surfacelod.SurfaceLodMod$ModMenu"
     ],
     "modmenu": [
       "com.surfacelod.SurfaceLodModMenu"
