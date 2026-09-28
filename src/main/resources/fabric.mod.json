@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "surface_lod",
+  "version": "${version}",
+  "name": "Surface LOD",
+  "description": "Lightweight surface-only distant terrain for low-end devices.",
+  "authors": [],
+  "license": "All-Rights-Reserved",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.surfacelod.SurfaceLodMod"
+    ],
+    "modmenu": [
+      "com.surfacelod.SurfaceLodModMenu"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "cloth-config": "*",
+    "modmenu": "*"
+  }
+}
