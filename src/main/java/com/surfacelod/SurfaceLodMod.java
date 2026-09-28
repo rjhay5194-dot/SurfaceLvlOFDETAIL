@@ -913,7 +913,7 @@ public class SurfaceLodMod implements ClientModInitializer {
                     }
                 }
 
-                MeshData built = bb.buildOrNull();
+                MeshData built = bb.build();
                 if (built != null) {
                     try {
                         mesh.quads = built.drawState().vertexCount() / 4;
