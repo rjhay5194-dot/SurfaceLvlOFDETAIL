@@ -696,7 +696,7 @@ public class SurfaceLodMod implements ClientModInitializer {
             }
         }
 
-        private record Draw(RegionMesh mesh, float ox, float oy, float oz) {
+        private record Draw(RegionMesh mesh, float ox, float oy, float oz, GpuBufferSlice transforms) {
         }
 
         private LodRenderer() {
@@ -812,7 +812,14 @@ public class SurfaceLodMod implements ClientModInitializer {
                         mesh = fresh;
                     }
                     if (mesh != null && mesh.buffer != null && mesh.quads > 0) {
-                        draws.add(new Draw(mesh, (float) (rx * 64 - cam.x), (float) (-cam.y), (float) (rz * 64 - cam.z)));
+                        float ox = (float) (rx * 64 - cam.x);
+                        float oy = (float) (-cam.y);
+                        float oz = (float) (rz * 64 - cam.z);
+                        Matrix4f modelView = new Matrix4f().set(RenderSystem.getModelViewMatrix());
+                        modelView.translate(ox, oy, oz);
+                        GpuBufferSlice transforms = RenderSystem.getDynamicUniforms()
+                                .writeTransform(modelView, COLOR_MODULATOR, MODEL_OFFSET, TEXTURE_MATRIX);
+                        draws.add(new Draw(mesh, ox, oy, oz, transforms));
                     }
                 }
             }
@@ -844,11 +851,7 @@ public class SurfaceLodMod implements ClientModInitializer {
                 pass.setIndexBuffer(indices, indexType);
 
                 for (Draw d : draws) {
-                    Matrix4f modelView = new Matrix4f().set(RenderSystem.getModelViewMatrix());
-                    modelView.translate(d.ox(), d.oy(), d.oz());
-                    GpuBufferSlice transforms = RenderSystem.getDynamicUniforms()
-                            .writeTransform(modelView, COLOR_MODULATOR, MODEL_OFFSET, TEXTURE_MATRIX);
-                    pass.setUniform("DynamicTransforms", transforms);
+                    pass.setUniform("DynamicTransforms", d.transforms());
                     pass.setVertexBuffer(0, d.mesh().buffer);
                     pass.drawIndexed(0, 0, d.mesh().quads * 6, 1);
                     drawnRegions++;
