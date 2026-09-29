@@ -703,10 +703,7 @@ public class SurfaceLodMod implements ClientModInitializer {
         }
 
         public static void init() {
-            // LAST fires after vanilla's own framebuffer writes/render pass for the frame are done,
-            // so it's safe to open our own RenderPass here. BEFORE_TRANSLUCENT fires while vanilla's
-            // pass is still open, which throws "Close the existing render pass..." on this GPU API.
-            WorldRenderEvents.LAST.register(LodRenderer::render);
+            WorldRenderEvents.BEFORE_TRANSLUCENT.register(LodRenderer::render);
         }
 
         public static void clearMeshes() {
