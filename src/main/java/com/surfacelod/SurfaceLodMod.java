@@ -21,6 +21,7 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
@@ -39,6 +40,7 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
@@ -46,11 +48,16 @@ import org.joml.Vector4f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -62,11 +69,16 @@ import java.util.Objects;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * Surface LOD - everything in one file (Mojang mappings).
- * Nested classes: Config, ConfigScreen, ChunkData, Store, Sampler, Manager, LodRenderer, Commands, ModMenu.
+ * Nested classes: Config, ConfigScreen, ChunkData, Store, DiskCache, Sampler, Manager, LodRenderer, Commands, ModMenu.
  */
 public class SurfaceLodMod implements ClientModInitializer {
     public static final String MOD_ID = "surface_lod";
@@ -136,13 +148,15 @@ public class SurfaceLodMod implements ClientModInitializer {
         public static final int MAX_DISTANCE = 256;
         public static final int MIN_CACHE_MB = 16;
         public static final int MAX_CACHE_MB = 512;
+        private static final int CONFIG_VERSION = 2;
 
         // ---- Settings (public so Gson can read/write them) ----
+        public int configVersion = 0;
         public boolean enabled = true;
         public boolean autoGenerate = true;
         public boolean pauseWhileFast = true;
         public int lodDistanceChunks = 48;
-        public LodQuality quality = LodQuality.LOW;
+        public LodQuality quality = LodQuality.BALANCED;
         public CpuMode cpuMode = CpuMode.LOW;
         public RenderStyle renderStyle = RenderStyle.BLOCKY;
         public boolean renderStructures = true;
@@ -150,6 +164,7 @@ public class SurfaceLodMod implements ClientModInitializer {
         public boolean sectionCulling = true;
         public boolean disableVanillaFog = false;
         public boolean smoothTransition = true;
+        public boolean diskCache = true;
         public int cacheSizeMb = 64;
 
         // ---- Load / save ----
@@ -176,6 +191,11 @@ public class SurfaceLodMod implements ClientModInitializer {
                     LOGGER.warn("Could not read surface_lod.json, using defaults", e);
                 }
             }
+            // One-time upgrade: older configs default to Low quality; move them to Balanced once.
+            if (instance.configVersion < CONFIG_VERSION) {
+                instance.quality = LodQuality.BALANCED;
+                instance.configVersion = CONFIG_VERSION;
+            }
             save();
         }
 
@@ -191,7 +211,7 @@ public class SurfaceLodMod implements ClientModInitializer {
         private void validate() {
             lodDistanceChunks = Math.max(MIN_DISTANCE, Math.min(MAX_DISTANCE, lodDistanceChunks));
             cacheSizeMb = Math.max(MIN_CACHE_MB, Math.min(MAX_CACHE_MB, cacheSizeMb));
-            if (quality == null) quality = LodQuality.LOW;
+            if (quality == null) quality = LodQuality.BALANCED;
             if (cpuMode == null) cpuMode = CpuMode.LOW;
             if (renderStyle == null) renderStyle = RenderStyle.BLOCKY;
         }
@@ -251,13 +271,19 @@ public class SurfaceLodMod implements ClientModInitializer {
                     .setSaveConsumer(v -> cfg.cacheSizeMb = v)
                     .build());
 
+            general.addEntry(eb.startBooleanToggle(Component.literal("Save LOD to disk"), cfg.diskCache)
+                    .setDefaultValue(def.diskCache)
+                    .setTooltip(Component.literal("Keeps LOD data per world so distant terrain is back right after you rejoin."))
+                    .setSaveConsumer(v -> cfg.diskCache = v)
+                    .build());
+
             // ---------- Quality & performance ----------
             ConfigCategory perf = builder.getOrCreateCategory(Component.literal("Quality & Performance"));
 
             perf.addEntry(eb.startEnumSelector(Component.literal("LOD quality"),
                             Config.LodQuality.class, cfg.quality)
                     .setDefaultValue(def.quality)
-                    .setTooltip(Component.literal("Detail level of LOD terrain. Lower is faster. Applies to newly collected chunks."))
+                    .setTooltip(Component.literal("Detail near the vanilla border. Farther terrain automatically uses less detail. Applies to newly collected chunks."))
                     .setSaveConsumer(v -> cfg.quality = v)
                     .build());
 
@@ -382,6 +408,38 @@ public class SurfaceLodMod implements ClientModInitializer {
             return n;
         }
 
+        // ---- Disk format ----
+        void write(DataOutputStream out) throws IOException {
+            out.writeInt(chunkX);
+            out.writeInt(chunkZ);
+            out.writeByte(cellsPerSide);
+            for (short s : heights) out.writeShort(s);
+            for (short s : colors) out.writeShort(s);
+            out.write(flags);
+            out.writeBoolean(leafColors != null);
+            if (leafColors != null) {
+                for (short s : leafColors) out.writeShort(s);
+            }
+        }
+
+        static ChunkData read(DataInputStream in) throws IOException {
+            int cx = in.readInt();
+            int cz = in.readInt();
+            int n = in.readUnsignedByte();
+            if (n < 1 || n > 16) {
+                throw new IOException("bad cell count " + n);
+            }
+            ChunkData d = new ChunkData(cx, cz, n);
+            for (int i = 0; i < d.heights.length; i++) d.heights[i] = in.readShort();
+            for (int i = 0; i < d.colors.length; i++) d.colors[i] = in.readShort();
+            in.readFully(d.flags);
+            if (in.readBoolean()) {
+                d.leafColors = new short[d.heights.length];
+                for (int i = 0; i < d.leafColors.length; i++) d.leafColors[i] = in.readShort();
+            }
+            return d;
+        }
+
         private static short pack(int rgb) {
             int r = (rgb >> 16) & 0xFF;
             int g = (rgb >> 8) & 0xFF;
@@ -429,8 +487,22 @@ public class SurfaceLodMod implements ClientModInitializer {
             bump(data.chunkX, data.chunkZ);
         }
 
+        /** Used when loading from disk: fresh data sampled this session always wins. */
+        public boolean putIfAbsent(ChunkData data) {
+            if (chunks.putIfAbsent(key(data.chunkX, data.chunkZ), data) != null) {
+                return false;
+            }
+            bytes.addAndGet(data.approxBytes());
+            bump(data.chunkX, data.chunkZ);
+            return true;
+        }
+
         public ChunkData get(int chunkX, int chunkZ) {
             return chunks.get(key(chunkX, chunkZ));
+        }
+
+        public List<ChunkData> snapshot() {
+            return new ArrayList<>(chunks.values());
         }
 
         public int size() {
@@ -470,6 +542,64 @@ public class SurfaceLodMod implements ClientModInitializer {
             long dx = d.chunkX - cx;
             long dz = d.chunkZ - cz;
             return dx * dx + dz * dz;
+        }
+    }
+
+    // ================= DiskCache =================
+    /** Saves and loads LOD data per world and dimension (gzip file in surface_lod_cache/). */
+    public static final class DiskCache {
+        private static final int MAGIC = 0x534C4F44; // "SLOD"
+        private static final int VERSION = 1;
+
+        private DiskCache() {
+        }
+
+        static synchronized void write(Path file, List<ChunkData> chunks) {
+            try {
+                Files.createDirectories(file.getParent());
+                Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+                try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(
+                        new GZIPOutputStream(Files.newOutputStream(tmp)), 1 << 16))) {
+                    out.writeInt(MAGIC);
+                    out.writeInt(VERSION);
+                    out.writeInt(chunks.size());
+                    for (ChunkData d : chunks) {
+                        d.write(out);
+                    }
+                }
+                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            } catch (Exception e) {
+                LOGGER.warn("Could not save LOD cache {}", file, e);
+            }
+        }
+
+        /** Runs on the IO thread. Stops quietly if the world changed (generation no longer matches). */
+        static void load(Path file, int generation) {
+            if (!Files.exists(file)) {
+                return;
+            }
+            int loaded = 0;
+            try (DataInputStream in = new DataInputStream(new BufferedInputStream(
+                    new GZIPInputStream(Files.newInputStream(file)), 1 << 16))) {
+                if (in.readInt() != MAGIC || in.readInt() != VERSION) {
+                    LOGGER.warn("Ignoring LOD cache with unknown format: {}", file);
+                    return;
+                }
+                int count = in.readInt();
+                for (int i = 0; i < count; i++) {
+                    if (generation != Manager.generation) {
+                        return;
+                    }
+                    ChunkData d = ChunkData.read(in);
+                    if (Manager.store().putIfAbsent(d)) {
+                        loaded++;
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Could not fully read LOD cache {} (kept {} chunks)", file, loaded, e);
+                return;
+            }
+            LOGGER.info("Loaded {} LOD chunks from disk cache", loaded);
         }
     }
 
@@ -549,13 +679,26 @@ public class SurfaceLodMod implements ClientModInitializer {
     }
 
     // ================= Manager =================
-    /** Collects surface data from chunks the client loads, within a per-tick CPU budget. */
+    /** Collects surface data from chunks the client loads, within a per-tick CPU budget. Also handles the disk cache. */
     public static final class Manager {
         private static final Store STORE = new Store();
         private static final LinkedHashSet<Long> PENDING = new LinkedHashSet<>();
         private static final double FAST_SPEED_SQ = 0.6 * 0.6; // blocks per tick, squared
+        private static final int AUTOSAVE_TICKS = 2400; // every 2 minutes
+
+        /** Bumped whenever the world changes so a slow disk load can stop itself. */
+        static volatile int generation;
+
+        private static final ExecutorService IO = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "SurfaceLOD-IO");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            return t;
+        });
 
         private static ClientLevel lastWorld;
+        private static Path cacheFile;
+        private static volatile boolean dirty;
         private static int tickCounter;
 
         private Manager() {
@@ -572,19 +715,28 @@ public class SurfaceLodMod implements ClientModInitializer {
                 PENDING.add(Store.key(x, z));
             });
             ClientTickEvents.END_CLIENT_TICK.register(Manager::tick);
+            ClientLifecycleEvents.CLIENT_STOPPING.register(client -> saveBlocking());
         }
 
         private static void tick(Minecraft client) {
             ClientLevel world = client.level;
             LocalPlayer player = client.player;
             if (world == null || player == null) {
+                if (lastWorld != null) {
+                    saveAsync();
+                }
                 clear();
                 lastWorld = null;
+                cacheFile = null;
                 return;
             }
             if (world != lastWorld) {
+                if (lastWorld != null) {
+                    saveAsync();
+                }
                 clear();
                 lastWorld = world;
+                openCache(client, world);
             }
 
             Config cfg = Config.get();
@@ -595,6 +747,9 @@ public class SurfaceLodMod implements ClientModInitializer {
             tickCounter++;
             if (tickCounter % 100 == 0) {
                 STORE.trim(cfg.cacheSizeMb * 1024L * 1024L, player.getBlockX() >> 4, player.getBlockZ() >> 4);
+            }
+            if (tickCounter % AUTOSAVE_TICKS == 0) {
+                saveAsync();
             }
 
             if (!cfg.autoGenerate) {
@@ -615,8 +770,89 @@ public class SurfaceLodMod implements ClientModInitializer {
                 LevelChunk chunk = world.getChunkSource().getChunkNow(x, z);
                 if (chunk != null) {
                     STORE.put(Sampler.sample(chunk, cells));
+                    dirty = true;
                 }
             }
+        }
+
+        // ---------- Disk cache handling ----------
+        private static void openCache(Minecraft mc, ClientLevel world) {
+            cacheFile = null;
+            Config cfg = Config.get();
+            if (!cfg.diskCache) {
+                return;
+            }
+            try {
+                String id;
+                var server = mc.getSingleplayerServer();
+                if (server != null) {
+                    id = "sp_" + server.getWorldPath(LevelResource.ROOT).normalize().getFileName();
+                } else if (mc.getCurrentServer() != null) {
+                    id = "mp_" + mc.getCurrentServer().ip;
+                } else {
+                    return;
+                }
+                String dim = world.dimension().toString();
+                Path dir = FabricLoader.getInstance().getGameDir().resolve("surface_lod_cache");
+                cacheFile = dir.resolve(sanitize(id) + "__" + sanitize(dim) + ".bin");
+            } catch (Exception e) {
+                LOGGER.warn("Could not work out the LOD cache file for this world", e);
+                return;
+            }
+            final int gen = ++generation;
+            final Path file = cacheFile;
+            IO.execute(() -> DiskCache.load(file, gen));
+        }
+
+        private static String sanitize(String s) {
+            String clean = s.replaceAll("[^A-Za-z0-9._-]", "_");
+            return clean.length() > 100 ? clean.substring(0, 100) : clean;
+        }
+
+        /** Copies the current data and writes it on the IO thread. */
+        public static void saveAsync() {
+            Path file = cacheFile;
+            if (file == null || !dirty || STORE.size() == 0) {
+                return;
+            }
+            dirty = false;
+            List<ChunkData> snapshot = STORE.snapshot();
+            IO.execute(() -> DiskCache.write(file, snapshot));
+        }
+
+        private static void saveBlocking() {
+            try {
+                Path file = cacheFile;
+                if (file != null && dirty && STORE.size() > 0) {
+                    dirty = false;
+                    DiskCache.write(file, STORE.snapshot());
+                }
+                IO.shutdown();
+                IO.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                LOGGER.warn("Could not save LOD cache on exit", e);
+            }
+        }
+
+        /** Deletes the disk cache of the current world and empties memory. */
+        public static void wipeCache() {
+            Path file = cacheFile;
+            clear();
+            dirty = false;
+            if (file != null) {
+                IO.execute(() -> {
+                    try {
+                        Files.deleteIfExists(file);
+                    } catch (IOException e) {
+                        LOGGER.warn("Could not delete LOD cache {}", file, e);
+                    }
+                });
+            }
+        }
+
+        public static String cacheName() {
+            Path file = cacheFile;
+            return file == null ? "none" : file.getFileName().toString();
         }
 
         private static int cellsPerSide(Config.LodQuality quality) {
@@ -639,7 +875,9 @@ public class SurfaceLodMod implements ClientModInitializer {
             };
         }
 
+        /** Empties memory only. The disk cache is left alone. */
         public static void clear() {
+            generation++;
             STORE.clear();
             PENDING.clear();
             LodRenderer.clearMeshes();
@@ -657,7 +895,8 @@ public class SurfaceLodMod implements ClientModInitializer {
     // ================= LodRenderer =================
     /**
      * Draws the LOD. Each 4x4-chunk region becomes one static GPU buffer (built once, reused every frame),
-     * drawn with a single draw call. Regions are drawn only outside the vanilla render distance.
+     * drawn with a single draw call. Regions overlap the vanilla render distance by one chunk (LOD sits
+     * slightly below the ground so vanilla hides it), and farther regions are meshed with fewer, larger cells.
      */
     public static final class LodRenderer {
         private static final RenderPipeline PIPELINE = RenderPipelines.register(
@@ -669,6 +908,8 @@ public class SurfaceLodMod implements ClientModInitializer {
         private static final Vector3f MODEL_OFFSET = new Vector3f();
         private static final Matrix4f TEXTURE_MATRIX = new Matrix4f();
         private static final int NONE = Integer.MIN_VALUE;
+        /** LOD is drawn this many blocks lower so it never fights with vanilla terrain where they overlap. */
+        private static final float Y_BIAS = 1.5f;
 
         private static final Map<Long, RegionMesh> MESHES = new HashMap<>();
         private static boolean hardFailed;
@@ -687,6 +928,7 @@ public class SurfaceLodMod implements ClientModInitializer {
             int dataVersion;
             int holeKey;
             int settingsKey;
+            int stride;
 
             void close() {
                 if (buffer != null) {
@@ -696,7 +938,10 @@ public class SurfaceLodMod implements ClientModInitializer {
             }
         }
 
-        private record Draw(RegionMesh mesh, float ox, float oy, float oz, GpuBufferSlice transforms) {
+        private record Draw(RegionMesh mesh, GpuBufferSlice transforms) {
+        }
+
+        private record Cand(int rx, int rz, int version, int holeKey, int stride, double dist) {
         }
 
         private LodRenderer() {
@@ -754,7 +999,8 @@ public class SurfaceLodMod implements ClientModInitializer {
             int camCx = Mth.floor(cam.x) >> 4;
             int camCz = Mth.floor(cam.z) >> 4;
             int vanillaRd = mc.options.getEffectiveRenderDistance();
-            int holeR = vanillaRd;
+            // Leave out one chunk less than vanilla draws, so the LOD overlaps under the vanilla edge (no sky gap).
+            int holeR = Math.max(1, vanillaRd - 1);
             // The vanilla far plane is about 4x the render distance, so LOD cannot go farther than that yet.
             int maxChunks = Math.min(cfg.lodDistanceChunks, vanillaRd * 4 - 1);
             if (maxChunks <= holeR) {
@@ -775,7 +1021,12 @@ public class SurfaceLodMod implements ClientModInitializer {
             double lx = cull ? look.x / lookH : 0;
             double lz = cull ? look.z / lookH : 0;
 
-            List<Draw> draws = new ArrayList<>();
+            double nearLimit = (holeR + 20) * 16.0;
+            double midLimit = (holeR + 44) * 16.0;
+
+            // Pass 1: which regions are visible, and which of them need a (re)build.
+            List<Cand> visible = new ArrayList<>();
+            List<Cand> stale = new ArrayList<>();
             for (int rz = camRz - regionRadius; rz <= camRz + regionRadius; rz++) {
                 for (int rx = camRx - regionRadius; rx <= camRx + regionRadius; rx++) {
                     int version = store.regionVersion(rx, rz);
@@ -795,32 +1046,50 @@ public class SurfaceLodMod implements ClientModInitializer {
                         }
                     }
 
+                    int stride = dist < nearLimit ? 1 : (dist < midLimit ? 2 : 4);
                     int holeKey = holeKeyFor(rx, rz, camCx, camCz, holeR);
-                    long key = Store.key(rx, rz);
-                    RegionMesh mesh = MESHES.get(key);
-                    boolean stale = mesh == null || mesh.dataVersion != version
-                            || mesh.holeKey != holeKey || mesh.settingsKey != settingsKey;
-                    if (stale && budget > 0) {
-                        budget--;
-                        RegionMesh fresh = build(store, cfg, rx, rz, version, holeKey, settingsKey, camCx, camCz, holeR);
-                        if (mesh != null) {
-                            gpuBytes -= mesh.bytes;
-                            mesh.close();
-                        }
-                        gpuBytes += fresh.bytes;
-                        MESHES.put(key, fresh);
-                        mesh = fresh;
+                    Cand c = new Cand(rx, rz, version, holeKey, stride, dist);
+                    visible.add(c);
+
+                    RegionMesh mesh = MESHES.get(Store.key(rx, rz));
+                    if (mesh == null || mesh.dataVersion != version || mesh.holeKey != holeKey
+                            || mesh.settingsKey != settingsKey || mesh.stride != stride) {
+                        stale.add(c);
                     }
-                    if (mesh != null && mesh.buffer != null && mesh.quads > 0) {
-                        float ox = (float) (rx * 64 - cam.x);
-                        float oy = (float) (-cam.y);
-                        float oz = (float) (rz * 64 - cam.z);
-                        Matrix4f modelView = new Matrix4f().set(RenderSystem.getModelViewMatrix());
-                        modelView.translate(ox, oy, oz);
-                        GpuBufferSlice transforms = RenderSystem.getDynamicUniforms()
-                                .writeTransform(modelView, COLOR_MODULATOR, MODEL_OFFSET, TEXTURE_MATRIX);
-                        draws.add(new Draw(mesh, ox, oy, oz, transforms));
+                }
+            }
+
+            // Pass 2: rebuild the stale regions closest to the camera first.
+            if (!stale.isEmpty()) {
+                stale.sort(Comparator.comparingDouble(Cand::dist));
+                for (int k = 0; k < stale.size() && k < budget; k++) {
+                    Cand c = stale.get(k);
+                    long key = Store.key(c.rx(), c.rz());
+                    RegionMesh fresh = build(store, cfg, c.rx(), c.rz(), c.version(), c.holeKey(), settingsKey,
+                            c.stride(), camCx, camCz, holeR);
+                    RegionMesh old = MESHES.get(key);
+                    if (old != null) {
+                        gpuBytes -= old.bytes;
+                        old.close();
                     }
+                    gpuBytes += fresh.bytes;
+                    MESHES.put(key, fresh);
+                }
+            }
+
+            // Pass 3: precompute transforms (must happen before the render pass opens).
+            List<Draw> draws = new ArrayList<>();
+            for (Cand c : visible) {
+                RegionMesh mesh = MESHES.get(Store.key(c.rx(), c.rz()));
+                if (mesh != null && mesh.buffer != null && mesh.quads > 0) {
+                    float ox = (float) (c.rx() * 64 - cam.x);
+                    float oy = (float) (-cam.y) - Y_BIAS;
+                    float oz = (float) (c.rz() * 64 - cam.z);
+                    Matrix4f modelView = new Matrix4f().set(RenderSystem.getModelViewMatrix());
+                    modelView.translate(ox, oy, oz);
+                    GpuBufferSlice transforms = RenderSystem.getDynamicUniforms()
+                            .writeTransform(modelView, COLOR_MODULATOR, MODEL_OFFSET, TEXTURE_MATRIX);
+                    draws.add(new Draw(mesh, transforms));
                 }
             }
 
@@ -894,11 +1163,12 @@ public class SurfaceLodMod implements ClientModInitializer {
 
         // ---------- Meshing ----------
         private static RegionMesh build(Store store, Config cfg, int rx, int rz, int version, int holeKey,
-                                        int settingsKey, int camCx, int camCz, int holeR) {
+                                        int settingsKey, int stride, int camCx, int camCz, int holeR) {
             RegionMesh mesh = new RegionMesh();
             mesh.dataVersion = version;
             mesh.holeKey = holeKey;
             mesh.settingsKey = settingsKey;
+            mesh.stride = stride;
 
             boolean blocky = cfg.renderStyle != Config.RenderStyle.FLAT;
             boolean trees = cfg.renderTrees;
@@ -915,7 +1185,7 @@ public class SurfaceLodMod implements ClientModInitializer {
                         }
                         ChunkData data = store.get(chunkX, chunkZ);
                         if (data != null) {
-                            meshChunk(bb, store, data, rx * 64, rz * 64, blocky, trees);
+                            meshChunk(bb, store, data, rx * 64, rz * 64, blocky, trees, stride);
                         }
                     }
                 }
@@ -935,39 +1205,61 @@ public class SurfaceLodMod implements ClientModInitializer {
             return mesh;
         }
 
+        /**
+         * stride = how many stored cells are merged into one drawn cell per side (1 = full detail).
+         * A merged cell uses its tallest cell, so hills keep their shape.
+         */
         private static void meshChunk(BufferBuilder bb, Store store, ChunkData d, int baseX, int baseZ,
-                                      boolean blocky, boolean trees) {
+                                      boolean blocky, boolean trees, int strideWanted) {
             int n = d.cellsPerSide;
-            int step = 16 / n;
+            int stride = Math.min(strideWanted, n);
+            int cellStep = 16 / n;
+            float cell = cellStep * stride;
+            boolean drawTrees = trees && strideWanted < 4;
             float ox = d.chunkX * 16 - baseX;
             float oz = d.chunkZ * 16 - baseZ;
 
-            for (int j = 0; j < n; j++) {
-                for (int i = 0; i < n; i++) {
-                    int idx = j * n + i;
-                    float x0 = ox + i * step;
-                    float x1 = x0 + step;
-                    float z0 = oz + j * step;
-                    float z1 = z0 + step;
-                    int h = d.heights[idx];
+            for (int gj = 0; gj < n; gj += stride) {
+                for (int gi = 0; gi < n; gi += stride) {
+                    int bi = gi;
+                    int bj = gj;
+                    int h = d.heights[gj * n + gi];
+                    if (stride > 1) {
+                        for (int j = gj; j < gj + stride; j++) {
+                            for (int i = gi; i < gi + stride; i++) {
+                                int hh = d.heights[j * n + i];
+                                if (hh > h) {
+                                    h = hh;
+                                    bi = i;
+                                    bj = j;
+                                }
+                            }
+                        }
+                    }
+                    int idx = bj * n + bi;
+
+                    float x0 = ox + gi * cellStep;
+                    float x1 = x0 + cell;
+                    float z0 = oz + gj * cellStep;
+                    float z1 = z0 + cell;
                     float top = h + 1f - (d.isWater(idx) ? 0.11f : 0f);
                     int rgb = d.color(idx);
 
                     quadTop(bb, x0, x1, z0, z1, top, rgb);
 
                     if (blocky) {
-                        int nh = neighborHeight(store, d, i, j, -1, 0);
+                        int nh = neighborHeight(store, d, gi - 1, bj);
                         if (nh != NONE && nh < h) quadSide(bb, 0, x0, x1, z0, z1, nh + 1f, top, rgb);
-                        nh = neighborHeight(store, d, i, j, 1, 0);
+                        nh = neighborHeight(store, d, gi + stride, bj);
                         if (nh != NONE && nh < h) quadSide(bb, 1, x0, x1, z0, z1, nh + 1f, top, rgb);
-                        nh = neighborHeight(store, d, i, j, 0, -1);
+                        nh = neighborHeight(store, d, bi, gj - 1);
                         if (nh != NONE && nh < h) quadSide(bb, 2, x0, x1, z0, z1, nh + 1f, top, rgb);
-                        nh = neighborHeight(store, d, i, j, 0, 1);
+                        nh = neighborHeight(store, d, bi, gj + stride);
                         if (nh != NONE && nh < h) quadSide(bb, 3, x0, x1, z0, z1, nh + 1f, top, rgb);
                     }
 
-                    if (trees && d.hasTree(idx)) {
-                        float half = Math.min(step, 5) / 2f;
+                    if (drawTrees && d.hasTree(idx)) {
+                        float half = Math.min(cell, 5f) / 2f;
                         float cx = (x0 + x1) / 2f;
                         float cz = (z0 + z1) / 2f;
                         float ty0 = h + 1f;
@@ -983,10 +1275,9 @@ public class SurfaceLodMod implements ClientModInitializer {
             }
         }
 
-        private static int neighborHeight(Store store, ChunkData d, int i, int j, int di, int dj) {
+        /** Height of the stored cell at (ni, nj) relative to chunk d; wraps into the neighbouring chunk. */
+        private static int neighborHeight(Store store, ChunkData d, int ni, int nj) {
             int n = d.cellsPerSide;
-            int ni = i + di;
-            int nj = j + dj;
             if (ni >= 0 && ni < n && nj >= 0 && nj < n) {
                 return d.heights[nj * n + ni];
             }
@@ -1050,7 +1341,7 @@ public class SurfaceLodMod implements ClientModInitializer {
     }
 
     // ================= Commands =================
-    /** /surfacelod stats and /surfacelod clear */
+    /** /surfacelod stats, /surfacelod save and /surfacelod clear */
     public static final class Commands {
         private Commands() {
         }
@@ -1068,13 +1359,19 @@ public class SurfaceLodMod implements ClientModInitializer {
                                         + " | render: " + LodRenderer.status
                                         + ", " + LodRenderer.drawnRegions + " regions, "
                                         + LodRenderer.drawnQuads + " quads, "
-                                        + (LodRenderer.gpuBytes / 1024) + " KB GPU";
+                                        + (LodRenderer.gpuBytes / 1024) + " KB GPU"
+                                        + " | cache: " + (cfg.diskCache ? Manager.cacheName() : "off");
                                 ctx.getSource().sendFeedback(Component.literal(msg));
                                 return Command.SINGLE_SUCCESS;
                             }))
+                            .then(ClientCommandManager.literal("save").executes(ctx -> {
+                                Manager.saveAsync();
+                                ctx.getSource().sendFeedback(Component.literal("Surface LOD: saving to disk"));
+                                return Command.SINGLE_SUCCESS;
+                            }))
                             .then(ClientCommandManager.literal("clear").executes(ctx -> {
-                                Manager.clear();
-                                ctx.getSource().sendFeedback(Component.literal("Surface LOD: data cleared"));
+                                Manager.wipeCache();
+                                ctx.getSource().sendFeedback(Component.literal("Surface LOD: data and disk cache cleared"));
                                 return Command.SINGLE_SUCCESS;
                             }))));
         }
