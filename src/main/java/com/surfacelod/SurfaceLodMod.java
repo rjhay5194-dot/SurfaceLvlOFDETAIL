@@ -671,7 +671,8 @@ public class SurfaceLodMod implements ClientModInitializer {
         private static final int NONE = Integer.MIN_VALUE;
 
         private static final Map<Long, RegionMesh> MESHES = new HashMap<>();
-        private static boolean failed;
+        private static boolean hardFailed;
+        private static long lastErrorLogNanos;
         private static int frame;
 
         public static String status = "waiting";
@@ -702,7 +703,10 @@ public class SurfaceLodMod implements ClientModInitializer {
         }
 
         public static void init() {
-            WorldRenderEvents.BEFORE_TRANSLUCENT.register(LodRenderer::render);
+            // LAST fires after vanilla's own framebuffer writes/render pass for the frame are done,
+            // so it's safe to open our own RenderPass here. BEFORE_TRANSLUCENT fires while vanilla's
+            // pass is still open, which throws "Close the existing render pass..." on this GPU API.
+            WorldRenderEvents.LAST.register(LodRenderer::render);
         }
 
         public static void clearMeshes() {
@@ -716,15 +720,18 @@ public class SurfaceLodMod implements ClientModInitializer {
         }
 
         private static void render(WorldRenderContext context) {
-            if (failed) {
+            if (hardFailed) {
                 return;
             }
             try {
                 renderInternal(context);
             } catch (Throwable t) {
-                failed = true;
                 status = "error: " + t;
-                LOGGER.error("Surface LOD rendering failed and was switched off", t);
+                long now = System.nanoTime();
+                if (now - lastErrorLogNanos > 5_000_000_000L) {
+                    lastErrorLogNanos = now;
+                    LOGGER.error("Surface LOD frame render failed, will retry next frame", t);
+                }
             }
         }
 
@@ -741,7 +748,7 @@ public class SurfaceLodMod implements ClientModInitializer {
                 return;
             }
             if (PIPELINE.getVertexFormatMode() != VertexFormat.Mode.QUADS) {
-                failed = true;
+                hardFailed = true;
                 status = "error: pipeline is not in QUADS mode";
                 return;
             }
